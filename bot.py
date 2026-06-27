@@ -191,7 +191,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
 
 
-def main() -> None:
+async def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
@@ -201,8 +201,13 @@ def main() -> None:
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("help", cmd_help))
     logger.info("Controller bot started.")
-    app.run_polling(drop_pending_updates=True)
+    async with app:
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        await app.updater.idle()
+        await app.stop()
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
