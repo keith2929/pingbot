@@ -316,7 +316,11 @@ async def main() -> None:
             ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
             ADD_ID:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_id)],
         },
-        fallbacks=[CommandHandler("cancel", add_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", add_cancel),
+            CommandHandler("abort", add_cancel),
+        ],
+        conversation_timeout=120,
     )
 
     remove_conv = ConversationHandler(
@@ -324,7 +328,11 @@ async def main() -> None:
         states={
             REMOVE_CONFIRM: [CallbackQueryHandler(remove_confirm, pattern="^remove:")],
         },
-        fallbacks=[CommandHandler("cancel", add_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", add_cancel),
+            CommandHandler("abort", add_cancel),
+        ],
+        conversation_timeout=120,
     )
 
     app.add_handler(add_conv)
