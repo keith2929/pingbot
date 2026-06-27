@@ -182,11 +182,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     text = (
-        "/wake <alias>              — resume a suspended service\n"
-        "/sleep <alias>             — suspend a running service\n"
+        "/wake [alias]              — resume a suspended service\n"
+        "/sleep [alias]             — suspend a running service\n"
         "/status                    — show all bots and their state\n"
-        "/add <alias> <service_id>  — register a new bot\n"
-        "/remove <alias>            — unregister a bot\n"
+        "/add [alias] [service_id]  — register a new bot\n"
+        "/remove [alias]            — unregister a bot\n"
         "/list                      — list all aliases and IDs\n"
         "/help                      — this message"
     )
