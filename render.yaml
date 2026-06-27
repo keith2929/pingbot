@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: pingbot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_ID
+        sync: false
+      - key: RENDER_API_KEY
+        sync: false
+    disk:
+      name: botdata
+      mountPath: /data
+      sizeGB: 1
