@@ -19,11 +19,16 @@ UPSTASH_URL = os.environ["UPSTASH_REDIS_REST_URL"]
 UPSTASH_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 
 RENDER_BASE = "https://api.render.com/v1"
-REDIS_KEY = "pingbot:bots"
+REDIS_BOTS_KEY = "pingbot:bots"
+REDIS_SUPABASE_KEY = "pingbot:supabase"
+
+SUPABASE_PING_INTERVAL = 6 * 24 * 60 * 60  # 6 days in seconds
 
 # Conversation states
 ADD_NAME, ADD_ID = range(2)
 REMOVE_CONFIRM = range(1)
+SB_ADD_NAME, SB_ADD_URL, SB_ADD_KEY = range(3)
+SB_REMOVE_CONFIRM = range(1)
 
 
 # ---------- Upstash Redis helpers ----------
@@ -35,20 +40,40 @@ async def redis(command: list) -> object:
     return r.json().get("result")
 
 
-async def load_bots() -> dict:
-    result = await redis(["HGETALL", REDIS_KEY])
+async def hgetall(key: str) -> dict:
+    result = await redis(["HGETALL", key])
     if not result:
         return {}
     it = iter(result)
     return dict(zip(it, it))
 
 
-async def save_bot(alias: str, service_id: str) -> None:
-    await redis(["HSET", REDIS_KEY, alias, service_id])
+# ---------- Bot registry ----------
 
+async def load_bots() -> dict:
+    return await hgetall(REDIS_BOTS_KEY)
+
+async def save_bot(alias: str, service_id: str) -> None:
+    await redis(["HSET", REDIS_BOTS_KEY, alias, service_id])
 
 async def delete_bot(alias: str) -> None:
-    await redis(["HDEL", REDIS_KEY, alias])
+    await redis(["HDEL", REDIS_BOTS_KEY, alias])
+
+
+# ---------- Supabase registry ----------
+# Stored as JSON strings: { "url": "...", "key": "..." }
+
+import json
+
+async def load_supabase() -> dict:
+    raw = await hgetall(REDIS_SUPABASE_KEY)
+    return {name: json.loads(val) for name, val in raw.items()}
+
+async def save_supabase(name: str, url: str, key: str) -> None:
+    await redis(["HSET", REDIS_SUPABASE_KEY, name, json.dumps({"url": url, "key": key})])
+
+async def delete_supabase(name: str) -> None:
+    await redis(["HDEL", REDIS_SUPABASE_KEY, name])
 
 
 # ---------- Render API helpers ----------
@@ -209,7 +234,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
 
-# ---------- Add (conversation) ----------
+# ---------- Add bot (conversation) ----------
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not auth(update):
@@ -236,12 +261,12 @@ async def add_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    ctx.user_data.pop("add_alias", None)
+    ctx.user_data.clear()
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 
-# ---------- Remove (conversation) ----------
+# ---------- Remove bot (conversation) ----------
 
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not auth(update):
@@ -274,21 +299,143 @@ async def remove_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ---------- Supabase ping ----------
+
+async def ping_supabase_projects(bot=None) -> list[str]:
+    projects = await load_supabase()
+    if not projects:
+        return []
+    results = []
+    for name, creds in projects.items():
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    f"{creds['url']}/storage/v1/bucket",
+                    headers={"apikey": creds["key"], "Authorization": f"Bearer {creds['key']}"},
+                    timeout=15,
+                )
+            if r.status_code < 500:
+                results.append(f"🟢 <b>{name}</b> — ok ({r.status_code})")
+            else:
+                results.append(f"🔴 <b>{name}</b> — error ({r.status_code})")
+        except Exception as e:
+            results.append(f"❌ <b>{name}</b> — {e}")
+    if bot:
+        msg = "🗄️ <b>Weekly Supabase ping</b>\n\n" + "\n".join(results)
+        await bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode="HTML")
+    return results
+
+
+async def supabase_ping_loop(bot) -> None:
+    while True:
+        await asyncio.sleep(SUPABASE_PING_INTERVAL)
+        logger.info("Running scheduled Supabase ping")
+        await ping_supabase_projects(bot)
+
+
+async def cmd_pingsupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not auth(update):
+        return
+    projects = await load_supabase()
+    if not projects:
+        await update.message.reply_text("No Supabase projects registered. Use /addsupabase first.")
+        return
+    await update.message.reply_text("Pinging Supabase projects...")
+    results = await ping_supabase_projects()
+    await update.message.reply_text("\n".join(results), parse_mode="HTML")
+
+
+# ---------- Add Supabase (conversation) ----------
+
+async def cmd_addsupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not auth(update):
+        return ConversationHandler.END
+    await update.message.reply_text("What would you like to call this Supabase project? (alias)")
+    return SB_ADD_NAME
+
+
+async def sb_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["sb_name"] = update.message.text.strip().lower()
+    await update.message.reply_text(
+        f"Got it: <b>{ctx.user_data['sb_name']}</b>\n\nNow send the Supabase project URL\n(e.g. <code>https://xxxx.supabase.co</code>)",
+        parse_mode="HTML",
+    )
+    return SB_ADD_URL
+
+
+async def sb_add_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["sb_url"] = update.message.text.strip().rstrip("/")
+    await update.message.reply_text(
+        "Now send the <b>anon/public API key</b> for this project\n(Supabase dashboard → Project Settings → API)",
+        parse_mode="HTML",
+    )
+    return SB_ADD_KEY
+
+
+async def sb_add_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    key = update.message.text.strip()
+    name = ctx.user_data.pop("sb_name")
+    url = ctx.user_data.pop("sb_url")
+    await save_supabase(name, url, key)
+    await update.message.reply_text(f"✅ Registered Supabase project <b>{name}</b>", parse_mode="HTML")
+    return ConversationHandler.END
+
+
+# ---------- Remove Supabase (conversation) ----------
+
+async def cmd_removesupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not auth(update):
+        return ConversationHandler.END
+    projects = await load_supabase()
+    if not projects:
+        await update.message.reply_text("No Supabase projects registered.")
+        return ConversationHandler.END
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"sbremove:{name}")]
+        for name in projects
+    ]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="sbremove:__cancel__")])
+    await update.message.reply_text(
+        "Which Supabase project would you like to remove?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return SB_REMOVE_CONFIRM
+
+
+async def sb_remove_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    _, name = query.data.split(":", 1)
+    if name == "__cancel__":
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+    await delete_supabase(name)
+    await query.edit_message_text(f"🗑️ Removed Supabase project <b>{name}</b>", parse_mode="HTML")
+    return ConversationHandler.END
+
+
 # ---------- Help ----------
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     lines = [
+        "🤖 <b>Render bots</b>",
         "/wake — resume a suspended service",
         "/sleep — suspend a running service",
         "/status — show all bots and their state",
         "/add — register a new bot",
         "/remove — unregister a bot",
         "/list — list all aliases and IDs",
+        "",
+        "🗄️ <b>Supabase</b>",
+        "/addsupabase — register a Supabase project",
+        "/removesupabase — unregister a Supabase project",
+        "/pingsupabase — ping all projects now",
+        "",
         "/help — this message",
     ]
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ---------- Health check ----------
@@ -316,10 +463,7 @@ async def main() -> None:
             ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
             ADD_ID:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_id)],
         },
-        fallbacks=[
-            CommandHandler("cancel", add_cancel),
-            CommandHandler("abort", add_cancel),
-        ],
+        fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
         conversation_timeout=120,
     )
 
@@ -328,20 +472,40 @@ async def main() -> None:
         states={
             REMOVE_CONFIRM: [CallbackQueryHandler(remove_confirm, pattern="^remove:")],
         },
-        fallbacks=[
-            CommandHandler("cancel", add_cancel),
-            CommandHandler("abort", add_cancel),
-        ],
+        fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
+        conversation_timeout=120,
+    )
+
+    sb_add_conv = ConversationHandler(
+        entry_points=[CommandHandler("addsupabase", cmd_addsupabase)],
+        states={
+            SB_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sb_add_name)],
+            SB_ADD_URL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, sb_add_url)],
+            SB_ADD_KEY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, sb_add_key)],
+        },
+        fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
+        conversation_timeout=120,
+    )
+
+    sb_remove_conv = ConversationHandler(
+        entry_points=[CommandHandler("removesupabase", cmd_removesupabase)],
+        states={
+            SB_REMOVE_CONFIRM: [CallbackQueryHandler(sb_remove_confirm, pattern="^sbremove:")],
+        },
+        fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
         conversation_timeout=120,
     )
 
     app.add_handler(add_conv)
     app.add_handler(remove_conv)
+    app.add_handler(sb_add_conv)
+    app.add_handler(sb_remove_conv)
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("pingsupabase", cmd_pingsupabase))
     app.add_handler(CommandHandler("help", cmd_help))
 
     await app.initialize()
@@ -352,11 +516,15 @@ async def main() -> None:
         BotCommand("add", "Register a new bot"),
         BotCommand("remove", "Unregister a bot"),
         BotCommand("list", "List all aliases and IDs"),
+        BotCommand("addsupabase", "Register a Supabase project"),
+        BotCommand("removesupabase", "Unregister a Supabase project"),
+        BotCommand("pingsupabase", "Ping all Supabase projects now"),
         BotCommand("help", "Show command reference"),
     ])
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Controller bot started.")
+    asyncio.create_task(supabase_ping_loop(app.bot))
     await asyncio.Event().wait()
 
 
