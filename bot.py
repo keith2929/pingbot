@@ -134,15 +134,14 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for alias, service_id in bots.items():
         status, body = await render_get(f"/services/{service_id}")
         if status == 200:
-            # Render v1 nests service data under "service" key
             svc = body.get("service", body)
-            suspended = svc.get("suspended")
-            if suspended is True:
-                state_str = "suspended"
-            elif suspended is False:
+            suspended = svc.get("suspended", "")
+            if suspended == "not_suspended":
                 state_str = "running"
+            elif suspended == "suspended":
+                state_str = "suspended"
             else:
-                state_str = svc.get("status", str(body))
+                state_str = suspended or "unknown"
         else:
             state_str = "error"
         lines.append(f"{alias:<15} {service_id:<30} {state_str}")
