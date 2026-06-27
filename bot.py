@@ -192,6 +192,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def main() -> None:
+    import asyncio
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
@@ -200,12 +201,11 @@ async def main() -> None:
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("help", cmd_help))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Controller bot started.")
-    async with app:
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        await app.updater.idle()
-        await app.stop()
+    await asyncio.Event().wait()  # block forever
 
 
 if __name__ == "__main__":
