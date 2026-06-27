@@ -1,10 +1,12 @@
 import os
 import json
 import logging
+import asyncio
 import httpx
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from aiohttp import web
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -191,8 +193,19 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
 
 
+async def health(request):
+    return web.Response(text="ok")
+
+
 async def main() -> None:
-    import asyncio
+    port = int(os.environ.get("PORT", 8080))
+    web_app = web.Application()
+    web_app.router.add_get("/", health)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logger.info(f"Health server on port {port}")
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
@@ -209,5 +222,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
