@@ -3,7 +3,10 @@ import logging
 import asyncio
 import httpx
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ConversationHandler, MessageHandler, filters, ContextTypes,
+)
 from aiohttp import web
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -17,6 +20,10 @@ UPSTASH_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 
 RENDER_BASE = "https://api.render.com/v1"
 REDIS_KEY = "pingbot:bots"
+
+# Conversation states
+ADD_NAME, ADD_ID = range(2)
+REMOVE_CONFIRM = range(1)
 
 
 # ---------- Upstash Redis helpers ----------
@@ -32,7 +39,6 @@ async def load_bots() -> dict:
     result = await redis(["HGETALL", REDIS_KEY])
     if not result:
         return {}
-    # HGETALL returns [field, value, field, value, ...]
     it = iter(result)
     return dict(zip(it, it))
 
@@ -81,7 +87,7 @@ def auth(update: Update) -> bool:
     return update.effective_user.id == ALLOWED_USER_ID
 
 
-# ---------- Handlers ----------
+# ---------- Wake / Sleep ----------
 
 async def bot_picker(update: Update, action: str) -> None:
     bots = await load_bots()
@@ -161,6 +167,8 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await do_sleep(reply, alias, bots[alias])
 
 
+# ---------- Status / List ----------
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
@@ -188,33 +196,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
 
-async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not auth(update):
-        return
-    if len(ctx.args) < 2:
-        await update.message.reply_text("Usage: /add [alias] [service_id]")
-        return
-    alias = ctx.args[0].lower()
-    service_id = ctx.args[1]
-    await save_bot(alias, service_id)
-    await update.message.reply_text(f"✅ Registered {alias} → {service_id}")
-
-
-async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not auth(update):
-        return
-    if not ctx.args:
-        await update.message.reply_text("Usage: /remove [alias]")
-        return
-    alias = ctx.args[0].lower()
-    bots = await load_bots()
-    if alias not in bots:
-        await update.message.reply_text(f"Unknown alias: {alias}")
-        return
-    await delete_bot(alias)
-    await update.message.reply_text(f"🗑️ Removed {alias}")
-
-
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
@@ -222,14 +203,78 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not bots:
         await update.message.reply_text("No bots registered.")
         return
-    lines = ["<pre>"]
-    lines.append(f"{'Alias':<15} Service ID")
-    lines.append("-" * 50)
+    lines = []
     for alias, service_id in bots.items():
-        lines.append(f"{alias:<15} {service_id}")
-    lines.append("</pre>")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        lines.append(f"• <b>{alias}</b>\n<code>{service_id}</code>")
+    await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
+
+# ---------- Add (conversation) ----------
+
+async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not auth(update):
+        return ConversationHandler.END
+    await update.message.reply_text("What would you like to call this bot? (alias)")
+    return ADD_NAME
+
+
+async def add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["add_alias"] = update.message.text.strip().lower()
+    await update.message.reply_text(
+        f"Got it: <b>{ctx.user_data['add_alias']}</b>\n\nNow send the Render service ID (starts with <code>srv-</code>)",
+        parse_mode="HTML",
+    )
+    return ADD_ID
+
+
+async def add_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    service_id = update.message.text.strip()
+    alias = ctx.user_data.pop("add_alias")
+    await save_bot(alias, service_id)
+    await update.message.reply_text(f"✅ Registered <b>{alias}</b> → <code>{service_id}</code>", parse_mode="HTML")
+    return ConversationHandler.END
+
+
+async def add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.pop("add_alias", None)
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+# ---------- Remove (conversation) ----------
+
+async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not auth(update):
+        return ConversationHandler.END
+    bots = await load_bots()
+    if not bots:
+        await update.message.reply_text("No bots registered.")
+        return ConversationHandler.END
+    buttons = [
+        [InlineKeyboardButton(alias, callback_data=f"remove:{alias}")]
+        for alias in bots
+    ]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="remove:__cancel__")])
+    await update.message.reply_text(
+        "Which bot would you like to remove?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return REMOVE_CONFIRM
+
+
+async def remove_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    _, alias = query.data.split(":", 1)
+    if alias == "__cancel__":
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+    await delete_bot(alias)
+    await query.edit_message_text(f"🗑️ Removed <b>{alias}</b>", parse_mode="HTML")
+    return ConversationHandler.END
+
+
+# ---------- Help ----------
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
@@ -264,14 +309,33 @@ async def main() -> None:
     logger.info(f"Health server on port {port}")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    add_conv = ConversationHandler(
+        entry_points=[CommandHandler("add", cmd_add)],
+        states={
+            ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
+            ADD_ID:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_id)],
+        },
+        fallbacks=[CommandHandler("cancel", add_cancel)],
+    )
+
+    remove_conv = ConversationHandler(
+        entry_points=[CommandHandler("remove", cmd_remove)],
+        states={
+            REMOVE_CONFIRM: [CallbackQueryHandler(remove_confirm, pattern="^remove:")],
+        },
+        fallbacks=[CommandHandler("cancel", add_cancel)],
+    )
+
+    app.add_handler(add_conv)
+    app.add_handler(remove_conv)
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("help", cmd_help))
+
     await app.initialize()
     await app.bot.set_my_commands([
         BotCommand("wake", "Resume a suspended service"),
