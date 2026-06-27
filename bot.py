@@ -169,27 +169,23 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No bots registered.")
         return
 
-    lines = ["<pre>"]
-    lines.append(f"{'Alias':<15} {'Service ID':<30} State")
-    lines.append("-" * 60)
-
+    lines = []
     for alias, service_id in bots.items():
         status, body = await render_get(f"/services/{service_id}")
         if status == 200:
             svc = body.get("service", body)
             suspended = svc.get("suspended", "")
             if suspended == "not_suspended":
-                state_str = "running"
+                icon, state_str = "🟢", "running"
             elif suspended == "suspended":
-                state_str = "suspended"
+                icon, state_str = "⏸️", "suspended"
             else:
-                state_str = suspended or "unknown"
+                icon, state_str = "❓", suspended or "unknown"
         else:
-            state_str = "error"
-        lines.append(f"{alias:<15} {service_id:<30} {state_str}")
+            icon, state_str = "❌", "error"
+        lines.append(f"{icon} <b>{alias}</b> — {state_str}\n<code>{service_id}</code>")
 
-    lines.append("</pre>")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
