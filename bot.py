@@ -4,7 +4,7 @@ import logging
 import asyncio
 import httpx
 from pathlib import Path
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 from aiohttp import web
 
@@ -181,16 +181,16 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
-    text = (
-        "/wake [alias]              — resume a suspended service\n"
-        "/sleep [alias]             — suspend a running service\n"
-        "/status                    — show all bots and their state\n"
-        "/add [alias] [service_id]  — register a new bot\n"
-        "/remove [alias]            — unregister a bot\n"
-        "/list                      — list all aliases and IDs\n"
-        "/help                      — this message"
-    )
-    await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
+    lines = [
+        "/wake — resume a suspended service",
+        "/sleep — suspend a running service",
+        "/status — show all bots and their state",
+        "/add — register a new bot",
+        "/remove — unregister a bot",
+        "/list — list all aliases and IDs",
+        "/help — this message",
+    ]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def health(request):
@@ -215,6 +215,15 @@ async def main() -> None:
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("help", cmd_help))
     await app.initialize()
+    await app.bot.set_my_commands([
+        BotCommand("wake", "Resume a suspended service"),
+        BotCommand("sleep", "Suspend a running service"),
+        BotCommand("status", "Show all bots and their state"),
+        BotCommand("add", "Register a new bot"),
+        BotCommand("remove", "Unregister a bot"),
+        BotCommand("list", "List all aliases and IDs"),
+        BotCommand("help", "Show command reference"),
+    ])
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Controller bot started.")
