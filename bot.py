@@ -2,8 +2,8 @@ import os
 import logging
 import asyncio
 import httpx
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from aiohttp import web
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -83,40 +83,82 @@ def auth(update: Update) -> bool:
 
 # ---------- Handlers ----------
 
+async def bot_picker(update: Update, action: str) -> None:
+    bots = await load_bots()
+    if not bots:
+        await update.message.reply_text("No bots registered. Use /add first.")
+        return
+    buttons = [
+        [InlineKeyboardButton(alias, callback_data=f"{action}:{alias}")]
+        for alias in bots
+    ]
+    label = "wake" if action == "wake" else "suspend"
+    await update.message.reply_text(
+        f"Which bot would you like to {label}?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
 async def cmd_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
-    if not ctx.args:
-        await update.message.reply_text("Usage: /wake [alias]")
-        return
-    alias = ctx.args[0].lower()
-    bots = await load_bots()
-    if alias not in bots:
-        await update.message.reply_text(f"Unknown alias: {alias}")
-        return
-    status, body = await render_post(f"/services/{bots[alias]}/resume")
-    if status in (200, 202):
-        await update.message.reply_text(f"✅ {alias} is waking up.")
+    if ctx.args:
+        alias = ctx.args[0].lower()
+        bots = await load_bots()
+        if alias not in bots:
+            await update.message.reply_text(f"Unknown alias: {alias}")
+            return
+        await do_wake(update.message.reply_text, alias, bots[alias])
     else:
-        await update.message.reply_text(f"❌ Failed to wake {alias}: {body.get('message', body)}")
+        await bot_picker(update, "wake")
 
 
 async def cmd_sleep(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
-    if not ctx.args:
-        await update.message.reply_text("Usage: /sleep [alias]")
+    if ctx.args:
+        alias = ctx.args[0].lower()
+        bots = await load_bots()
+        if alias not in bots:
+            await update.message.reply_text(f"Unknown alias: {alias}")
+            return
+        await do_sleep(update.message.reply_text, alias, bots[alias])
+    else:
+        await bot_picker(update, "sleep")
+
+
+async def do_wake(reply, alias: str, service_id: str) -> None:
+    status, body = await render_post(f"/services/{service_id}/resume")
+    if status in (200, 202):
+        await reply(f"✅ {alias} is waking up.")
+    else:
+        await reply(f"❌ Failed to wake {alias}: {body.get('message', body)}")
+
+
+async def do_sleep(reply, alias: str, service_id: str) -> None:
+    status, body = await render_post(f"/services/{service_id}/suspend")
+    if status in (200, 202):
+        await reply(f"💤 {alias} is going to sleep.")
+    else:
+        await reply(f"❌ Failed to suspend {alias}: {body.get('message', body)}")
+
+
+async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query.from_user.id != ALLOWED_USER_ID:
+        await query.answer()
         return
-    alias = ctx.args[0].lower()
+    await query.answer()
+    action, alias = query.data.split(":", 1)
     bots = await load_bots()
     if alias not in bots:
-        await update.message.reply_text(f"Unknown alias: {alias}")
+        await query.edit_message_text(f"Unknown alias: {alias}")
         return
-    status, body = await render_post(f"/services/{bots[alias]}/suspend")
-    if status in (200, 202):
-        await update.message.reply_text(f"💤 {alias} is going to sleep.")
-    else:
-        await update.message.reply_text(f"❌ Failed to suspend {alias}: {body.get('message', body)}")
+    reply = query.edit_message_text
+    if action == "wake":
+        await do_wake(reply, alias, bots[alias])
+    elif action == "sleep":
+        await do_sleep(reply, alias, bots[alias])
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -228,6 +270,7 @@ async def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
+    app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
