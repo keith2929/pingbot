@@ -1,9 +1,7 @@
 import os
-import json
 import logging
 import asyncio
 import httpx
-from pathlib import Path
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 from aiohttp import web
@@ -14,25 +12,40 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 RENDER_API_KEY = os.environ["RENDER_API_KEY"]
+UPSTASH_URL = os.environ["UPSTASH_REDIS_REST_URL"]
+UPSTASH_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 
-BOTS_FILE = Path("/data/bots.json")
 RENDER_BASE = "https://api.render.com/v1"
+REDIS_KEY = "pingbot:bots"
 
 
-def load_bots() -> dict:
-    if BOTS_FILE.exists():
-        return json.loads(BOTS_FILE.read_text())
-    return {}
+# ---------- Upstash Redis helpers ----------
+
+async def redis(command: list) -> object:
+    url = f"{UPSTASH_URL}/{'/'.join(str(c) for c in command)}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=10)
+    return r.json().get("result")
 
 
-def save_bots(bots: dict) -> None:
-    BOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BOTS_FILE.write_text(json.dumps(bots, indent=2))
+async def load_bots() -> dict:
+    result = await redis(["HGETALL", REDIS_KEY])
+    if not result:
+        return {}
+    # HGETALL returns [field, value, field, value, ...]
+    it = iter(result)
+    return dict(zip(it, it))
 
 
-def auth(update: Update) -> bool:
-    return update.effective_user.id == ALLOWED_USER_ID
+async def save_bot(alias: str, service_id: str) -> None:
+    await redis(["HSET", REDIS_KEY, alias, service_id])
 
+
+async def delete_bot(alias: str) -> None:
+    await redis(["HDEL", REDIS_KEY, alias])
+
+
+# ---------- Render API helpers ----------
 
 async def render_post(path: str) -> tuple[int, dict]:
     async with httpx.AsyncClient() as client:
@@ -62,50 +75,54 @@ async def render_get(path: str) -> tuple[int, dict]:
     return r.status_code, body
 
 
+# ---------- Auth ----------
+
+def auth(update: Update) -> bool:
+    return update.effective_user.id == ALLOWED_USER_ID
+
+
+# ---------- Handlers ----------
+
 async def cmd_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     if not ctx.args:
-        await update.message.reply_text("Usage: /wake <alias>")
+        await update.message.reply_text("Usage: /wake [alias]")
         return
     alias = ctx.args[0].lower()
-    bots = load_bots()
+    bots = await load_bots()
     if alias not in bots:
         await update.message.reply_text(f"Unknown alias: {alias}")
         return
-    service_id = bots[alias]
-    status, body = await render_post(f"/services/{service_id}/resume")
+    status, body = await render_post(f"/services/{bots[alias]}/resume")
     if status in (200, 202):
         await update.message.reply_text(f"✅ {alias} is waking up.")
     else:
-        msg = body.get("message", str(body))
-        await update.message.reply_text(f"❌ Failed to wake {alias}: {msg}")
+        await update.message.reply_text(f"❌ Failed to wake {alias}: {body.get('message', body)}")
 
 
 async def cmd_sleep(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     if not ctx.args:
-        await update.message.reply_text("Usage: /sleep <alias>")
+        await update.message.reply_text("Usage: /sleep [alias]")
         return
     alias = ctx.args[0].lower()
-    bots = load_bots()
+    bots = await load_bots()
     if alias not in bots:
         await update.message.reply_text(f"Unknown alias: {alias}")
         return
-    service_id = bots[alias]
-    status, body = await render_post(f"/services/{service_id}/suspend")
+    status, body = await render_post(f"/services/{bots[alias]}/suspend")
     if status in (200, 202):
         await update.message.reply_text(f"💤 {alias} is going to sleep.")
     else:
-        msg = body.get("message", str(body))
-        await update.message.reply_text(f"❌ Failed to suspend {alias}: {msg}")
+        await update.message.reply_text(f"❌ Failed to suspend {alias}: {body.get('message', body)}")
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
-    bots = load_bots()
+    bots = await load_bots()
     if not bots:
         await update.message.reply_text("No bots registered.")
         return
@@ -117,10 +134,10 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for alias, service_id in bots.items():
         status, body = await render_get(f"/services/{service_id}")
         if status == 200:
-            state = body.get("suspended", None)
-            if state is True:
+            suspended = body.get("suspended")
+            if suspended is True:
                 state_str = "suspended"
-            elif state is False:
+            elif suspended is False:
                 state_str = "running"
             else:
                 state_str = body.get("status", "unknown")
@@ -136,13 +153,11 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     if len(ctx.args) < 2:
-        await update.message.reply_text("Usage: /add <alias> <service_id>")
+        await update.message.reply_text("Usage: /add [alias] [service_id]")
         return
     alias = ctx.args[0].lower()
     service_id = ctx.args[1]
-    bots = load_bots()
-    bots[alias] = service_id
-    save_bots(bots)
+    await save_bot(alias, service_id)
     await update.message.reply_text(f"✅ Registered {alias} → {service_id}")
 
 
@@ -150,22 +165,21 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     if not ctx.args:
-        await update.message.reply_text("Usage: /remove <alias>")
+        await update.message.reply_text("Usage: /remove [alias]")
         return
     alias = ctx.args[0].lower()
-    bots = load_bots()
+    bots = await load_bots()
     if alias not in bots:
         await update.message.reply_text(f"Unknown alias: {alias}")
         return
-    del bots[alias]
-    save_bots(bots)
+    await delete_bot(alias)
     await update.message.reply_text(f"🗑️ Removed {alias}")
 
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
-    bots = load_bots()
+    bots = await load_bots()
     if not bots:
         await update.message.reply_text("No bots registered.")
         return
@@ -193,9 +207,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+# ---------- Health check ----------
+
 async def health(request):
     return web.Response(text="ok")
 
+
+# ---------- Entry point ----------
 
 async def main() -> None:
     port = int(os.environ.get("PORT", 8080))
@@ -227,7 +245,7 @@ async def main() -> None:
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Controller bot started.")
-    await asyncio.Event().wait()  # block forever
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
