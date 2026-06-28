@@ -719,9 +719,35 @@ async def fetch_deploys(alias: str, service_id: str, query) -> None:
 
 async def fetch_deploy_logs(service_id: str, deploy_id: str, alias: str, query) -> None:
     await query.edit_message_text(f"⏳ Fetching logs for deploy <code>{deploy_id[:8]}</code>...", parse_mode="HTML")
-    status, body = await render_get(f"/services/{service_id}/logs?deployId={deploy_id}&limit=100")
-    if status != 200:
-        await query.edit_message_text(f"❌ Could not fetch logs (HTTP {status}).")
+
+    # Try known Render log endpoints in order
+    endpoints = [
+        f"/services/{service_id}/deploys/{deploy_id}/logs",
+        f"/deploys/{deploy_id}/logs",
+        f"/services/{service_id}/logs?deployId={deploy_id}",
+    ]
+    body = None
+    for ep in endpoints:
+        status, resp = await render_get(ep)
+        if status == 200:
+            body = resp
+            break
+
+    if body is None:
+        # Fall back: show deploy detail only
+        status, resp = await render_get(f"/services/{service_id}/deploys/{deploy_id}")
+        if status == 200:
+            d = resp.get("deploy", resp)
+            detail = (
+                f"📋 <b>{alias}</b> deploy <code>{deploy_id[:8]}</code>\n\n"
+                f"Status: {d.get('status', 'unknown')}\n"
+                f"Created: {d.get('createdAt', '')[:16].replace('T', ' ')}\n"
+                f"Finished: {d.get('finishedAt', '')[:16].replace('T', ' ')}\n\n"
+                f"⚠️ Full logs not available via Render API for this service type."
+            )
+            await query.edit_message_text(detail, parse_mode="HTML")
+        else:
+            await query.edit_message_text("❌ Could not fetch logs or deploy details.")
         return
 
     entries = body if isinstance(body, list) else body.get("logs", [])
@@ -729,7 +755,6 @@ async def fetch_deploy_logs(service_id: str, deploy_id: str, alias: str, query) 
         await query.edit_message_text(f"No logs found for deploy <code>{deploy_id[:8]}</code>.", parse_mode="HTML")
         return
 
-    # Build log text, keeping it under Telegram's 4096 char limit
     log_lines = []
     for e in entries:
         msg = e.get("message", "") if isinstance(e, dict) else str(e)
@@ -741,10 +766,7 @@ async def fetch_deploy_logs(service_id: str, deploy_id: str, alias: str, query) 
     if len(log_text) > max_log:
         log_text = "…(truncated)\n" + log_text[-max_log:]
 
-    await query.edit_message_text(
-        header + f"<pre>{log_text}</pre>",
-        parse_mode="HTML",
-    )
+    await query.edit_message_text(header + f"<pre>{log_text}</pre>", parse_mode="HTML")
 
 
 # ---------- Help
