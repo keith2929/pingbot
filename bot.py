@@ -47,10 +47,14 @@ SB_REMOVE_CONFIRM = 0
 # ---------- Upstash Redis ----------
 
 async def redis(command: list) -> object:
-    url = f"{UPSTASH_URL}/{'/'.join(str(c) for c in command)}"
     async with httpx.AsyncClient() as client:
-        r = await client.get(url, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=10)
-    return r.json().get("result")
+        r = await client.post(
+            f"{UPSTASH_URL}/pipeline",
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            json=[command],
+            timeout=10,
+        )
+    return r.json()[0].get("result")
 
 
 async def hgetall(key: str) -> dict:
