@@ -420,6 +420,21 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer()
         return
     await query.answer()
+
+    if query.data.startswith("deploys:"):
+        _, alias = query.data.split(":", 1)
+        bots = await load_bots()
+        if alias not in bots:
+            await query.edit_message_text(f"Unknown alias: {alias}")
+            return
+        await fetch_deploys(alias, bots[alias]["service_id"], query)
+        return
+
+    if query.data.startswith("deploylog:"):
+        _, service_id, deploy_id, alias = query.data.split(":", 3)
+        await fetch_deploy_logs(service_id, deploy_id, alias, query)
+        return
+
     action, name = query.data.split(":", 1)
 
     if action == "pingsb":
@@ -642,12 +657,103 @@ async def supabase_ping_loop(bot) -> None:
 
 
 
+# ---------- Deploys
+
+DEPLOY_STATUS_ICON = {
+    "live": "✅",
+    "build_failed": "❌",
+    "update_failed": "❌",
+    "canceled": "🚫",
+    "deactivated": "⏸️",
+    "pre_deploy_failed": "❌",
+}
+
+async def cmd_deploys(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not auth(update):
+        return
+    bots = await load_bots()
+    if not bots:
+        await update.message.reply_text("No bots registered. Use /add first.")
+        return
+    buttons = [
+        [InlineKeyboardButton(alias, callback_data=f"deploys:{alias}")]
+        for alias in bots
+    ]
+    await update.message.reply_text(
+        "Which bot's deploys would you like to see?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def fetch_deploys(alias: str, service_id: str, query) -> None:
+    status, body = await render_get(f"/services/{service_id}/deploys?limit=5")
+    if status != 200:
+        await query.edit_message_text(f"❌ Could not fetch deploys for {alias}.")
+        return
+
+    deploys = body if isinstance(body, list) else body.get("deploys", [])
+    if not deploys:
+        await query.edit_message_text(f"No deploys found for <b>{alias}</b>.", parse_mode="HTML")
+        return
+
+    buttons = []
+    lines = [f"🚀 <b>{alias}</b> — recent deploys\n"]
+    for entry in deploys:
+        d = entry.get("deploy", entry)
+        deploy_id = d.get("id", "")
+        deploy_status = d.get("status", "unknown")
+        created = d.get("createdAt", "")[:16].replace("T", " ")
+        icon = DEPLOY_STATUS_ICON.get(deploy_status, "🔄")
+        lines.append(f"{icon} <code>{deploy_id[:8]}</code> {created} — {deploy_status}")
+        buttons.append([InlineKeyboardButton(
+            f"{icon} {created} {deploy_status}",
+            callback_data=f"deploylog:{service_id}:{deploy_id}:{alias}"
+        )])
+
+    await query.edit_message_text(
+        "\n".join(lines) + "\n\nTap a deploy to view its logs.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
+    )
+
+
+async def fetch_deploy_logs(service_id: str, deploy_id: str, alias: str, query) -> None:
+    await query.edit_message_text(f"⏳ Fetching logs for deploy <code>{deploy_id[:8]}</code>...", parse_mode="HTML")
+    status, body = await render_get(f"/services/{service_id}/logs?deployId={deploy_id}&limit=100")
+    if status != 200:
+        await query.edit_message_text(f"❌ Could not fetch logs (HTTP {status}).")
+        return
+
+    entries = body if isinstance(body, list) else body.get("logs", [])
+    if not entries:
+        await query.edit_message_text(f"No logs found for deploy <code>{deploy_id[:8]}</code>.", parse_mode="HTML")
+        return
+
+    # Build log text, keeping it under Telegram's 4096 char limit
+    log_lines = []
+    for e in entries:
+        msg = e.get("message", "") if isinstance(e, dict) else str(e)
+        log_lines.append(msg)
+
+    log_text = "\n".join(log_lines)
+    header = f"📋 <b>{alias}</b> deploy <code>{deploy_id[:8]}</code>\n\n"
+    max_log = 4000 - len(header)
+    if len(log_text) > max_log:
+        log_text = "…(truncated)\n" + log_text[-max_log:]
+
+    await query.edit_message_text(
+        header + f"<pre>{log_text}</pre>",
+        parse_mode="HTML",
+    )
+
+
 # ---------- Help
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     lines = [
+        "/deploys — view recent deploys and logs",
         "/ping — ping a Render bot or Supabase project",
         "/wake — resume a suspended Render service",
         "/sleep — suspend a running Render service",
@@ -709,6 +815,7 @@ async def main() -> None:
 
     app.add_handler(add_conv)
     app.add_handler(remove_conv)
+    app.add_handler(CommandHandler("deploys", cmd_deploys))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
@@ -719,6 +826,7 @@ async def main() -> None:
 
     await app.initialize()
     await app.bot.set_my_commands([
+        BotCommand("deploys", "View recent deploys and logs"),
         BotCommand("ping", "Ping a Render bot or Supabase project"),
         BotCommand("wake", "Resume a suspended Render service"),
         BotCommand("sleep", "Suspend a running Render service"),
