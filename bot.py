@@ -26,9 +26,21 @@ REDIS_SUPABASE_KEY = "pingbot:supabase"
 SUPABASE_PING_INTERVAL = 6 * 24 * 60 * 60  # 6 days
 
 # Conversation states
-ADD_NAME, ADD_ID, ADD_URL = range(3)
+(
+    ADD_TYPE,           # choose Supabase or Render
+    ADD_RENDER_ACTION,  # choose Add new or Edit existing
+    ADD_NAME,           # new bot: enter name
+    ADD_ID,             # new bot: enter service ID
+    ADD_URL,            # new bot: enter URL
+    EDIT_PICK_BOT,      # edit: pick which bot
+    EDIT_PICK_FIELD,    # edit: pick which field
+    EDIT_VALUE,         # edit: enter new value
+    SB_ADD_NAME,        # supabase: enter name
+    SB_ADD_URL,         # supabase: enter URL
+    SB_ADD_KEY,         # supabase: enter key
+) = range(11)
+
 REMOVE_CONFIRM = 0
-SB_ADD_NAME, SB_ADD_URL, SB_ADD_KEY = range(3)
 SB_REMOVE_CONFIRM = 0
 
 
@@ -50,7 +62,7 @@ async def hgetall(key: str) -> dict:
 
 
 # ---------- Bot registry
-# Each entry stored as JSON: {"service_id": "srv-...", "url": "https://..."}
+# Each entry: {"service_id": "srv-...", "url": "https://..."}
 
 async def load_bots() -> dict[str, dict]:
     raw = await hgetall(REDIS_BOTS_KEY)
@@ -59,7 +71,6 @@ async def load_bots() -> dict[str, dict]:
         try:
             out[alias] = json.loads(val)
         except Exception:
-            # Legacy entries stored as plain service_id string
             out[alias] = {"service_id": val, "url": ""}
     return out
 
@@ -121,6 +132,218 @@ async def render_get(path: str) -> tuple[int, dict]:
 
 def auth(update: Update) -> bool:
     return update.effective_user.id == ALLOWED_USER_ID
+
+
+# ---------- /add unified flow
+
+async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not auth(update):
+        return ConversationHandler.END
+    ctx.user_data.clear()
+    buttons = [
+        [InlineKeyboardButton("🗄️ Supabase", callback_data="addtype:supabase")],
+        [InlineKeyboardButton("🤖 Render bot", callback_data="addtype:render")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="addtype:cancel")],
+    ]
+    await update.message.reply_text(
+        "What would you like to add?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ADD_TYPE
+
+
+async def add_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":")[1]
+
+    if choice == "cancel":
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+
+    if choice == "supabase":
+        await query.edit_message_text("What would you like to call this Supabase project? (alias)")
+        return SB_ADD_NAME
+
+    # Render
+    buttons = [
+        [InlineKeyboardButton("➕ Add new bot", callback_data="renderaction:new")],
+        [InlineKeyboardButton("✏️ Edit existing bot", callback_data="renderaction:edit")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="renderaction:cancel")],
+    ]
+    await query.edit_message_text(
+        "Render bot — what would you like to do?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ADD_RENDER_ACTION
+
+
+async def add_render_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":")[1]
+
+    if choice == "cancel":
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+
+    if choice == "new":
+        await query.edit_message_text("What would you like to call this bot? (alias)")
+        return ADD_NAME
+
+    # Edit existing
+    bots = await load_bots()
+    if not bots:
+        await query.edit_message_text("No bots registered yet.")
+        return ConversationHandler.END
+    buttons = [
+        [InlineKeyboardButton(alias, callback_data=f"editbot:{alias}")]
+        for alias in bots
+    ]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="editbot:__cancel__")])
+    await query.edit_message_text(
+        "Which bot would you like to edit?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return EDIT_PICK_BOT
+
+
+# --- New bot steps
+
+async def add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["add_alias"] = update.message.text.strip().lower()
+    await update.message.reply_text(
+        f"Got it: <b>{ctx.user_data['add_alias']}</b>\n\nNow send the Render service ID (starts with <code>srv-</code>)",
+        parse_mode="HTML",
+    )
+    return ADD_ID
+
+
+async def add_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["add_service_id"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Now send the bot's public URL\n(e.g. <code>https://my-bot.onrender.com</code>)",
+        parse_mode="HTML",
+    )
+    return ADD_URL
+
+
+async def add_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text.strip().rstrip("/")
+    alias = ctx.user_data.pop("add_alias")
+    service_id = ctx.user_data.pop("add_service_id")
+    await save_bot(alias, service_id, url)
+    await update.message.reply_text(
+        f"✅ Registered <b>{alias}</b>\n<code>{service_id}</code>\n🔗 {url}",
+        parse_mode="HTML",
+    )
+    return ConversationHandler.END
+
+
+# --- Edit existing bot steps
+
+async def edit_pick_bot(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    alias = query.data.split(":", 1)[1]
+
+    if alias == "__cancel__":
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+
+    ctx.user_data["edit_alias"] = alias
+    buttons = [
+        [InlineKeyboardButton("Name (alias)", callback_data="editfield:name")],
+        [InlineKeyboardButton("Service ID", callback_data="editfield:service_id")],
+        [InlineKeyboardButton("URL", callback_data="editfield:url")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="editfield:cancel")],
+    ]
+    await query.edit_message_text(
+        f"Editing <b>{alias}</b> — which field?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
+    )
+    return EDIT_PICK_FIELD
+
+
+async def edit_pick_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    field = query.data.split(":")[1]
+
+    if field == "cancel":
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+
+    ctx.user_data["edit_field"] = field
+    labels = {"name": "new alias", "service_id": "new service ID (srv-...)", "url": "new URL"}
+    await query.edit_message_text(f"Send the {labels[field]}:")
+    return EDIT_VALUE
+
+
+async def edit_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    alias = ctx.user_data.pop("edit_alias")
+    field = ctx.user_data.pop("edit_field")
+
+    bots = await load_bots()
+    info = bots.get(alias, {"service_id": "", "url": ""})
+
+    if field == "name":
+        # Rename: delete old, save under new alias
+        await delete_bot(alias)
+        await save_bot(value.lower(), info["service_id"], info["url"])
+        await update.message.reply_text(
+            f"✅ Renamed <b>{alias}</b> → <b>{value.lower()}</b>", parse_mode="HTML"
+        )
+    elif field == "service_id":
+        await save_bot(alias, value, info["url"])
+        await update.message.reply_text(
+            f"✅ Updated <b>{alias}</b> service ID → <code>{value}</code>", parse_mode="HTML"
+        )
+    elif field == "url":
+        await save_bot(alias, info["service_id"], value.rstrip("/"))
+        await update.message.reply_text(
+            f"✅ Updated <b>{alias}</b> URL → {value}", parse_mode="HTML"
+        )
+    return ConversationHandler.END
+
+
+# --- Supabase steps (inside unified add flow)
+
+async def sb_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["sb_name"] = update.message.text.strip().lower()
+    await update.message.reply_text(
+        f"Got it: <b>{ctx.user_data['sb_name']}</b>\n\nNow send the Supabase project URL\n(e.g. <code>https://xxxx.supabase.co</code>)",
+        parse_mode="HTML",
+    )
+    return SB_ADD_URL
+
+
+async def sb_add_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data["sb_url"] = update.message.text.strip().rstrip("/")
+    await update.message.reply_text(
+        "Now send the <b>anon/public API key</b>\n(Supabase → Project Settings → API)",
+        parse_mode="HTML",
+    )
+    return SB_ADD_KEY
+
+
+async def sb_add_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    key = update.message.text.strip()
+    name = ctx.user_data.pop("sb_name")
+    url = ctx.user_data.pop("sb_url")
+    await save_supabase(name, url, key)
+    await update.message.reply_text(
+        f"✅ Registered Supabase project <b>{name}</b>", parse_mode="HTML"
+    )
+    return ConversationHandler.END
+
+
+async def add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.clear()
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
 
 
 # ---------- Wake / Sleep
@@ -204,7 +427,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     elif action == "ping":
         url = bots[alias].get("url", "")
         if not url:
-            await reply(f"⚠️ No URL stored for {alias}. Re-add the bot with /add to include a URL.")
+            await reply(f"⚠️ No URL stored for {alias}. Edit it with /add → Render bot → Edit existing.")
             return
         await query.edit_message_text(f"🏓 Pinging <b>{alias}</b>...", parse_mode="HTML")
         asyncio.create_task(ping_until_ready(query.message, alias, url))
@@ -291,51 +514,6 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
 
-# ---------- Add bot (conversation)
-
-async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not auth(update):
-        return ConversationHandler.END
-    await update.message.reply_text("What would you like to call this bot? (alias)")
-    return ADD_NAME
-
-
-async def add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    ctx.user_data["add_alias"] = update.message.text.strip().lower()
-    await update.message.reply_text(
-        f"Got it: <b>{ctx.user_data['add_alias']}</b>\n\nNow send the Render service ID (starts with <code>srv-</code>)",
-        parse_mode="HTML",
-    )
-    return ADD_ID
-
-
-async def add_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    ctx.user_data["add_service_id"] = update.message.text.strip()
-    await update.message.reply_text(
-        "Now send the bot's public URL (e.g. <code>https://my-bot.onrender.com</code>)",
-        parse_mode="HTML",
-    )
-    return ADD_URL
-
-
-async def add_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    url = update.message.text.strip().rstrip("/")
-    alias = ctx.user_data.pop("add_alias")
-    service_id = ctx.user_data.pop("add_service_id")
-    await save_bot(alias, service_id, url)
-    await update.message.reply_text(
-        f"✅ Registered <b>{alias}</b>\n<code>{service_id}</code>\n🔗 {url}",
-        parse_mode="HTML",
-    )
-    return ConversationHandler.END
-
-
-async def add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    ctx.user_data.clear()
-    await update.message.reply_text("Cancelled.")
-    return ConversationHandler.END
-
-
 # ---------- Remove bot (conversation)
 
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -408,47 +586,11 @@ async def cmd_pingsupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     projects = await load_supabase()
     if not projects:
-        await update.message.reply_text("No Supabase projects registered. Use /addsupabase first.")
+        await update.message.reply_text("No Supabase projects registered. Use /add first.")
         return
     await update.message.reply_text("Pinging Supabase projects...")
     results = await ping_supabase_projects()
     await update.message.reply_text("\n".join(results), parse_mode="HTML")
-
-
-# ---------- Add Supabase (conversation)
-
-async def cmd_addsupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not auth(update):
-        return ConversationHandler.END
-    await update.message.reply_text("What would you like to call this Supabase project? (alias)")
-    return SB_ADD_NAME
-
-
-async def sb_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    ctx.user_data["sb_name"] = update.message.text.strip().lower()
-    await update.message.reply_text(
-        f"Got it: <b>{ctx.user_data['sb_name']}</b>\n\nNow send the Supabase project URL\n(e.g. <code>https://xxxx.supabase.co</code>)",
-        parse_mode="HTML",
-    )
-    return SB_ADD_URL
-
-
-async def sb_add_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    ctx.user_data["sb_url"] = update.message.text.strip().rstrip("/")
-    await update.message.reply_text(
-        "Now send the <b>anon/public API key</b> for this project\n(Supabase dashboard → Project Settings → API)",
-        parse_mode="HTML",
-    )
-    return SB_ADD_KEY
-
-
-async def sb_add_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    key = update.message.text.strip()
-    name = ctx.user_data.pop("sb_name")
-    url = ctx.user_data.pop("sb_url")
-    await save_supabase(name, url, key)
-    await update.message.reply_text(f"✅ Registered Supabase project <b>{name}</b>", parse_mode="HTML")
-    return ConversationHandler.END
 
 
 # ---------- Remove Supabase (conversation)
@@ -495,12 +637,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/wake — resume a suspended service",
         "/sleep — suspend a running service",
         "/status — show all bots and their state",
-        "/add — register a new bot",
+        "/add — add or edit a bot / Supabase project",
         "/remove — unregister a bot",
         "/list — list all aliases and IDs",
         "",
         "🗄️ <b>Supabase</b>",
-        "/addsupabase — register a Supabase project",
         "/removesupabase — unregister a Supabase project",
         "/pingsupabase — ping all projects now",
         "",
@@ -531,29 +672,26 @@ async def main() -> None:
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("add", cmd_add)],
         states={
-            ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
-            ADD_ID:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_id)],
-            ADD_URL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_url)],
+            ADD_TYPE: [CallbackQueryHandler(add_type, pattern="^addtype:")],
+            ADD_RENDER_ACTION: [CallbackQueryHandler(add_render_action, pattern="^renderaction:")],
+            ADD_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
+            ADD_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, add_id)],
+            ADD_URL:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_url)],
+            EDIT_PICK_BOT:   [CallbackQueryHandler(edit_pick_bot, pattern="^editbot:")],
+            EDIT_PICK_FIELD: [CallbackQueryHandler(edit_pick_field, pattern="^editfield:")],
+            EDIT_VALUE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
+            SB_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sb_add_name)],
+            SB_ADD_URL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, sb_add_url)],
+            SB_ADD_KEY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, sb_add_key)],
         },
         fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
-        conversation_timeout=120,
+        conversation_timeout=180,
     )
 
     remove_conv = ConversationHandler(
         entry_points=[CommandHandler("remove", cmd_remove)],
         states={
             REMOVE_CONFIRM: [CallbackQueryHandler(remove_confirm, pattern="^remove:")],
-        },
-        fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
-        conversation_timeout=120,
-    )
-
-    sb_add_conv = ConversationHandler(
-        entry_points=[CommandHandler("addsupabase", cmd_addsupabase)],
-        states={
-            SB_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sb_add_name)],
-            SB_ADD_URL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, sb_add_url)],
-            SB_ADD_KEY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, sb_add_key)],
         },
         fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
         conversation_timeout=120,
@@ -570,7 +708,6 @@ async def main() -> None:
 
     app.add_handler(add_conv)
     app.add_handler(remove_conv)
-    app.add_handler(sb_add_conv)
     app.add_handler(sb_remove_conv)
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("wake", cmd_wake))
@@ -587,10 +724,9 @@ async def main() -> None:
         BotCommand("wake", "Resume a suspended service"),
         BotCommand("sleep", "Suspend a running service"),
         BotCommand("status", "Show all bots and their state"),
-        BotCommand("add", "Register a new bot"),
+        BotCommand("add", "Add or edit a bot / Supabase project"),
         BotCommand("remove", "Unregister a bot"),
         BotCommand("list", "List all aliases and IDs"),
-        BotCommand("addsupabase", "Register a Supabase project"),
         BotCommand("removesupabase", "Unregister a Supabase project"),
         BotCommand("pingsupabase", "Ping all Supabase projects now"),
         BotCommand("help", "Show command reference"),
