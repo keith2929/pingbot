@@ -748,7 +748,7 @@ async def fetch_deploy_logs(service_id: str, deploy_id: str, alias: str, query) 
 
     status, body = await render_get(f"/logs?{params}")
     if status != 200:
-        await query.edit_message_text(f"❌ Could not fetch logs (HTTP {status}).")
+        await query.edit_message_text(f"❌ Could not fetch logs (HTTP {status}).\n<code>{str(body)[:300]}</code>", parse_mode="HTML")
         return
 
     entries = body if isinstance(body, list) else body.get("logs", [])
