@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import asyncio
 import httpx
@@ -22,16 +23,16 @@ RENDER_BASE = "https://api.render.com/v1"
 REDIS_BOTS_KEY = "pingbot:bots"
 REDIS_SUPABASE_KEY = "pingbot:supabase"
 
-SUPABASE_PING_INTERVAL = 6 * 24 * 60 * 60  # 6 days in seconds
+SUPABASE_PING_INTERVAL = 6 * 24 * 60 * 60  # 6 days
 
 # Conversation states
-ADD_NAME, ADD_ID = range(2)
-REMOVE_CONFIRM = range(1)
+ADD_NAME, ADD_ID, ADD_URL = range(3)
+REMOVE_CONFIRM = 0
 SB_ADD_NAME, SB_ADD_URL, SB_ADD_KEY = range(3)
-SB_REMOVE_CONFIRM = range(1)
+SB_REMOVE_CONFIRM = 0
 
 
-# ---------- Upstash Redis helpers ----------
+# ---------- Upstash Redis ----------
 
 async def redis(command: list) -> object:
     url = f"{UPSTASH_URL}/{'/'.join(str(c) for c in command)}"
@@ -48,35 +49,45 @@ async def hgetall(key: str) -> dict:
     return dict(zip(it, it))
 
 
-# ---------- Bot registry ----------
+# ---------- Bot registry
+# Each entry stored as JSON: {"service_id": "srv-...", "url": "https://..."}
 
-async def load_bots() -> dict:
-    return await hgetall(REDIS_BOTS_KEY)
+async def load_bots() -> dict[str, dict]:
+    raw = await hgetall(REDIS_BOTS_KEY)
+    out = {}
+    for alias, val in raw.items():
+        try:
+            out[alias] = json.loads(val)
+        except Exception:
+            # Legacy entries stored as plain service_id string
+            out[alias] = {"service_id": val, "url": ""}
+    return out
 
-async def save_bot(alias: str, service_id: str) -> None:
-    await redis(["HSET", REDIS_BOTS_KEY, alias, service_id])
+
+async def save_bot(alias: str, service_id: str, url: str) -> None:
+    await redis(["HSET", REDIS_BOTS_KEY, alias, json.dumps({"service_id": service_id, "url": url})])
+
 
 async def delete_bot(alias: str) -> None:
     await redis(["HDEL", REDIS_BOTS_KEY, alias])
 
 
-# ---------- Supabase registry ----------
-# Stored as JSON strings: { "url": "...", "key": "..." }
-
-import json
+# ---------- Supabase registry
 
 async def load_supabase() -> dict:
     raw = await hgetall(REDIS_SUPABASE_KEY)
     return {name: json.loads(val) for name, val in raw.items()}
 
+
 async def save_supabase(name: str, url: str, key: str) -> None:
     await redis(["HSET", REDIS_SUPABASE_KEY, name, json.dumps({"url": url, "key": key})])
+
 
 async def delete_supabase(name: str) -> None:
     await redis(["HDEL", REDIS_SUPABASE_KEY, name])
 
 
-# ---------- Render API helpers ----------
+# ---------- Render API
 
 async def render_post(path: str) -> tuple[int, dict]:
     async with httpx.AsyncClient() as client:
@@ -106,13 +117,13 @@ async def render_get(path: str) -> tuple[int, dict]:
     return r.status_code, body
 
 
-# ---------- Auth ----------
+# ---------- Auth
 
 def auth(update: Update) -> bool:
     return update.effective_user.id == ALLOWED_USER_ID
 
 
-# ---------- Wake / Sleep ----------
+# ---------- Wake / Sleep
 
 async def bot_picker(update: Update, action: str) -> None:
     bots = await load_bots()
@@ -139,7 +150,7 @@ async def cmd_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if alias not in bots:
             await update.message.reply_text(f"Unknown alias: {alias}")
             return
-        await do_wake(update.message.reply_text, alias, bots[alias])
+        await do_wake(update.message.reply_text, alias, bots[alias]["service_id"])
     else:
         await bot_picker(update, "wake")
 
@@ -153,7 +164,7 @@ async def cmd_sleep(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if alias not in bots:
             await update.message.reply_text(f"Unknown alias: {alias}")
             return
-        await do_sleep(update.message.reply_text, alias, bots[alias])
+        await do_sleep(update.message.reply_text, alias, bots[alias]["service_id"])
     else:
         await bot_picker(update, "sleep")
 
@@ -187,12 +198,57 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     reply = query.edit_message_text
     if action == "wake":
-        await do_wake(reply, alias, bots[alias])
+        await do_wake(reply, alias, bots[alias]["service_id"])
     elif action == "sleep":
-        await do_sleep(reply, alias, bots[alias])
+        await do_sleep(reply, alias, bots[alias]["service_id"])
+    elif action == "ping":
+        url = bots[alias].get("url", "")
+        if not url:
+            await reply(f"⚠️ No URL stored for {alias}. Re-add the bot with /add to include a URL.")
+            return
+        await query.edit_message_text(f"🏓 Pinging <b>{alias}</b>...", parse_mode="HTML")
+        asyncio.create_task(ping_until_ready(query.message, alias, url))
 
 
-# ---------- Status / List ----------
+# ---------- Ping until ready
+
+async def ping_until_ready(message, alias: str, url: str, poll_interval: int = 30, timeout: int = 300) -> None:
+    elapsed = 0
+    while elapsed < timeout:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url, timeout=10)
+            if r.status_code < 500:
+                await message.edit_text(f"✅ <b>{alias}</b> is ready to use!", parse_mode="HTML")
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+        await message.edit_text(
+            f"🏓 Pinging <b>{alias}</b>... ({elapsed}s elapsed)", parse_mode="HTML"
+        )
+    await message.edit_text(f"⏱️ <b>{alias}</b> did not respond after {timeout}s.", parse_mode="HTML")
+
+
+async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not auth(update):
+        return
+    bots = await load_bots()
+    if not bots:
+        await update.message.reply_text("No bots registered. Use /add first.")
+        return
+    buttons = [
+        [InlineKeyboardButton(alias, callback_data=f"ping:{alias}")]
+        for alias in bots
+    ]
+    await update.message.reply_text(
+        "Which bot would you like to ping?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# ---------- Status / List
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
@@ -203,8 +259,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     lines = []
-    for alias, service_id in bots.items():
-        status, body = await render_get(f"/services/{service_id}")
+    for alias, info in bots.items():
+        status, body = await render_get(f"/services/{info['service_id']}")
         if status == 200:
             svc = body.get("service", body)
             suspended = svc.get("suspended", "")
@@ -216,7 +272,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 icon, state_str = "❓", suspended or "unknown"
         else:
             icon, state_str = "❌", "error"
-        lines.append(f"{icon} <b>{alias}</b> — {state_str}\n<code>{service_id}</code>")
+        lines.append(f"{icon} <b>{alias}</b> — {state_str}\n<code>{info['service_id']}</code>")
 
     await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
@@ -229,12 +285,13 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No bots registered.")
         return
     lines = []
-    for alias, service_id in bots.items():
-        lines.append(f"• <b>{alias}</b>\n<code>{service_id}</code>")
+    for alias, info in bots.items():
+        url_line = f"\n🔗 {info['url']}" if info.get("url") else ""
+        lines.append(f"• <b>{alias}</b>\n<code>{info['service_id']}</code>{url_line}")
     await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
 
 
-# ---------- Add bot (conversation) ----------
+# ---------- Add bot (conversation)
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not auth(update):
@@ -253,10 +310,23 @@ async def add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def add_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    service_id = update.message.text.strip()
+    ctx.user_data["add_service_id"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Now send the bot's public URL (e.g. <code>https://my-bot.onrender.com</code>)",
+        parse_mode="HTML",
+    )
+    return ADD_URL
+
+
+async def add_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text.strip().rstrip("/")
     alias = ctx.user_data.pop("add_alias")
-    await save_bot(alias, service_id)
-    await update.message.reply_text(f"✅ Registered <b>{alias}</b> → <code>{service_id}</code>", parse_mode="HTML")
+    service_id = ctx.user_data.pop("add_service_id")
+    await save_bot(alias, service_id, url)
+    await update.message.reply_text(
+        f"✅ Registered <b>{alias}</b>\n<code>{service_id}</code>\n🔗 {url}",
+        parse_mode="HTML",
+    )
     return ConversationHandler.END
 
 
@@ -266,7 +336,7 @@ async def add_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ---------- Remove bot (conversation) ----------
+# ---------- Remove bot (conversation)
 
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not auth(update):
@@ -299,7 +369,7 @@ async def remove_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ---------- Supabase ping ----------
+# ---------- Supabase ping
 
 async def ping_supabase_projects(bot=None) -> list[str]:
     projects = await load_supabase()
@@ -345,7 +415,7 @@ async def cmd_pingsupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(results), parse_mode="HTML")
 
 
-# ---------- Add Supabase (conversation) ----------
+# ---------- Add Supabase (conversation)
 
 async def cmd_addsupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not auth(update):
@@ -381,7 +451,7 @@ async def sb_add_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ---------- Remove Supabase (conversation) ----------
+# ---------- Remove Supabase (conversation)
 
 async def cmd_removesupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not auth(update):
@@ -414,13 +484,14 @@ async def sb_remove_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
-# ---------- Help ----------
+# ---------- Help
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     lines = [
         "🤖 <b>Render bots</b>",
+        "/ping — wake a bot and notify when ready",
         "/wake — resume a suspended service",
         "/sleep — suspend a running service",
         "/status — show all bots and their state",
@@ -438,13 +509,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-# ---------- Health check ----------
+# ---------- Health check
 
 async def health(request):
     return web.Response(text="ok")
 
 
-# ---------- Entry point ----------
+# ---------- Entry point
 
 async def main() -> None:
     port = int(os.environ.get("PORT", 8080))
@@ -462,6 +533,7 @@ async def main() -> None:
         states={
             ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
             ADD_ID:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_id)],
+            ADD_URL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_url)],
         },
         fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
         conversation_timeout=120,
@@ -500,6 +572,7 @@ async def main() -> None:
     app.add_handler(remove_conv)
     app.add_handler(sb_add_conv)
     app.add_handler(sb_remove_conv)
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
     app.add_handler(CallbackQueryHandler(callback_handler))
@@ -510,6 +583,7 @@ async def main() -> None:
 
     await app.initialize()
     await app.bot.set_my_commands([
+        BotCommand("ping", "Wake a bot and notify when ready"),
         BotCommand("wake", "Resume a suspended service"),
         BotCommand("sleep", "Suspend a running service"),
         BotCommand("status", "Show all bots and their state"),
