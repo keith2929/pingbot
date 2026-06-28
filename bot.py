@@ -41,7 +41,6 @@ SUPABASE_PING_INTERVAL = 6 * 24 * 60 * 60  # 6 days
 ) = range(11)
 
 REMOVE_CONFIRM = 0
-SB_REMOVE_CONFIRM = 0
 
 
 # ---------- Upstash Redis ----------
@@ -417,24 +416,50 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     if query.from_user.id != ALLOWED_USER_ID:
         await query.answer()
         return
+    if query.data == "noop":
+        await query.answer()
+        return
     await query.answer()
-    action, alias = query.data.split(":", 1)
+    action, name = query.data.split(":", 1)
+
+    if action == "pingsb":
+        projects = await load_supabase()
+        if name not in projects:
+            await query.edit_message_text(f"Unknown project: {name}")
+            return
+        creds = projects[name]
+        await query.edit_message_text(f"🏓 Pinging <b>{name}</b>...", parse_mode="HTML")
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    f"{creds['url']}/storage/v1/bucket",
+                    headers={"apikey": creds["key"], "Authorization": f"Bearer {creds['key']}"},
+                    timeout=15,
+                )
+            icon = "🟢" if r.status_code < 500 else "🔴"
+            await query.edit_message_text(
+                f"{icon} <b>{name}</b> — {r.status_code}", parse_mode="HTML"
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ <b>{name}</b> — {e}", parse_mode="HTML")
+        return
+
     bots = await load_bots()
-    if alias not in bots:
-        await query.edit_message_text(f"Unknown alias: {alias}")
+    if name not in bots:
+        await query.edit_message_text(f"Unknown alias: {name}")
         return
     reply = query.edit_message_text
     if action == "wake":
-        await do_wake(reply, alias, bots[alias]["service_id"])
+        await do_wake(reply, name, bots[name]["service_id"])
     elif action == "sleep":
-        await do_sleep(reply, alias, bots[alias]["service_id"])
+        await do_sleep(reply, name, bots[name]["service_id"])
     elif action == "ping":
-        url = bots[alias].get("url", "")
+        url = bots[name].get("url", "")
         if not url:
-            await reply(f"⚠️ No URL stored for {alias}. Edit it with /add → Render bot → Edit existing.")
+            await reply(f"⚠️ No URL stored for {name}. Edit it with /add → Render bot → Edit existing.")
             return
-        await query.edit_message_text(f"🏓 Pinging <b>{alias}</b>...", parse_mode="HTML")
-        asyncio.create_task(ping_until_ready(query.message, alias, url))
+        await query.edit_message_text(f"🏓 Pinging <b>{name}</b>...", parse_mode="HTML")
+        asyncio.create_task(ping_until_ready(query.message, name, url))
 
 
 # ---------- Ping until ready
@@ -462,15 +487,21 @@ async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     bots = await load_bots()
-    if not bots:
-        await update.message.reply_text("No bots registered. Use /add first.")
+    projects = await load_supabase()
+    if not bots and not projects:
+        await update.message.reply_text("Nothing registered. Use /add first.")
         return
-    buttons = [
-        [InlineKeyboardButton(alias, callback_data=f"ping:{alias}")]
-        for alias in bots
-    ]
+    buttons = []
+    if bots:
+        buttons.append([InlineKeyboardButton("── 🤖 Render bots ──", callback_data="noop")])
+        for alias in bots:
+            buttons.append([InlineKeyboardButton(alias, callback_data=f"ping:{alias}")])
+    if projects:
+        buttons.append([InlineKeyboardButton("── 🗄️ Supabase ──", callback_data="noop")])
+        for name in projects:
+            buttons.append([InlineKeyboardButton(name, callback_data=f"pingsb:{name}")])
     await update.message.reply_text(
-        "Which bot would you like to ping?",
+        "What would you like to ping?",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -531,22 +562,28 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-# ---------- Remove bot (conversation)
+# ---------- Remove (unified)
 
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if not auth(update):
         return ConversationHandler.END
     bots = await load_bots()
-    if not bots:
-        await update.message.reply_text("No bots registered.")
+    projects = await load_supabase()
+    if not bots and not projects:
+        await update.message.reply_text("Nothing registered.")
         return ConversationHandler.END
-    buttons = [
-        [InlineKeyboardButton(alias, callback_data=f"remove:{alias}")]
-        for alias in bots
-    ]
+    buttons = []
+    if bots:
+        buttons.append([InlineKeyboardButton("── 🤖 Render bots ──", callback_data="remove:__noop__")])
+        for alias in bots:
+            buttons.append([InlineKeyboardButton(alias, callback_data=f"remove:{alias}")])
+    if projects:
+        buttons.append([InlineKeyboardButton("── 🗄️ Supabase ──", callback_data="remove:__noop__")])
+        for name in projects:
+            buttons.append([InlineKeyboardButton(name, callback_data=f"removesb:{name}")])
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="remove:__cancel__")])
     await update.message.reply_text(
-        "Which bot would you like to remove?",
+        "What would you like to remove?",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     return REMOVE_CONFIRM
@@ -555,12 +592,17 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def remove_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    _, alias = query.data.split(":", 1)
-    if alias == "__cancel__":
-        await query.edit_message_text("Cancelled.")
-        return ConversationHandler.END
-    await delete_bot(alias)
-    await query.edit_message_text(f"🗑️ Removed <b>{alias}</b>", parse_mode="HTML")
+    action, name = query.data.split(":", 1)
+    if name in ("__cancel__", "__noop__"):
+        if name == "__cancel__":
+            await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END if name == "__cancel__" else REMOVE_CONFIRM
+    if action == "removesb":
+        await delete_supabase(name)
+        await query.edit_message_text(f"🗑️ Removed Supabase project <b>{name}</b>", parse_mode="HTML")
+    else:
+        await delete_bot(name)
+        await query.edit_message_text(f"🗑️ Removed <b>{name}</b>", parse_mode="HTML")
     return ConversationHandler.END
 
 
@@ -598,49 +640,6 @@ async def supabase_ping_loop(bot) -> None:
         await ping_supabase_projects(bot)
 
 
-async def cmd_pingsupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not auth(update):
-        return
-    projects = await load_supabase()
-    if not projects:
-        await update.message.reply_text("No Supabase projects registered. Use /add first.")
-        return
-    await update.message.reply_text("Pinging Supabase projects...")
-    results = await ping_supabase_projects()
-    await update.message.reply_text("\n".join(results), parse_mode="HTML")
-
-
-# ---------- Remove Supabase (conversation)
-
-async def cmd_removesupabase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not auth(update):
-        return ConversationHandler.END
-    projects = await load_supabase()
-    if not projects:
-        await update.message.reply_text("No Supabase projects registered.")
-        return ConversationHandler.END
-    buttons = [
-        [InlineKeyboardButton(name, callback_data=f"sbremove:{name}")]
-        for name in projects
-    ]
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="sbremove:__cancel__")])
-    await update.message.reply_text(
-        "Which Supabase project would you like to remove?",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-    return SB_REMOVE_CONFIRM
-
-
-async def sb_remove_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    _, name = query.data.split(":", 1)
-    if name == "__cancel__":
-        await query.edit_message_text("Cancelled.")
-        return ConversationHandler.END
-    await delete_supabase(name)
-    await query.edit_message_text(f"🗑️ Removed Supabase project <b>{name}</b>", parse_mode="HTML")
-    return ConversationHandler.END
 
 
 # ---------- Help
@@ -649,19 +648,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     lines = [
-        "🤖 <b>Render bots</b>",
-        "/ping — wake a bot and notify when ready",
-        "/wake — resume a suspended service",
-        "/sleep — suspend a running service",
-        "/status — show all bots and their state",
+        "/ping — ping a Render bot or Supabase project",
+        "/wake — resume a suspended Render service",
+        "/sleep — suspend a running Render service",
+        "/status — show all Render bots and their state",
         "/add — add or edit a bot / Supabase project",
-        "/remove — unregister a bot",
-        "/list — list all aliases and IDs",
-        "",
-        "🗄️ <b>Supabase</b>",
-        "/removesupabase — unregister a Supabase project",
-        "/pingsupabase — ping all projects now",
-        "",
+        "/remove — remove a bot or Supabase project",
+        "/list — list everything registered",
         "/help — this message",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -708,16 +701,7 @@ async def main() -> None:
     remove_conv = ConversationHandler(
         entry_points=[CommandHandler("remove", cmd_remove)],
         states={
-            REMOVE_CONFIRM: [CallbackQueryHandler(remove_confirm, pattern="^remove:")],
-        },
-        fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
-        conversation_timeout=120,
-    )
-
-    sb_remove_conv = ConversationHandler(
-        entry_points=[CommandHandler("removesupabase", cmd_removesupabase)],
-        states={
-            SB_REMOVE_CONFIRM: [CallbackQueryHandler(sb_remove_confirm, pattern="^sbremove:")],
+            REMOVE_CONFIRM: [CallbackQueryHandler(remove_confirm, pattern="^remove:|^removesb:")],
         },
         fallbacks=[CommandHandler("cancel", add_cancel), CommandHandler("abort", add_cancel)],
         conversation_timeout=120,
@@ -725,27 +709,23 @@ async def main() -> None:
 
     app.add_handler(add_conv)
     app.add_handler(remove_conv)
-    app.add_handler(sb_remove_conv)
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("pingsupabase", cmd_pingsupabase))
     app.add_handler(CommandHandler("help", cmd_help))
 
     await app.initialize()
     await app.bot.set_my_commands([
-        BotCommand("ping", "Wake a bot and notify when ready"),
-        BotCommand("wake", "Resume a suspended service"),
-        BotCommand("sleep", "Suspend a running service"),
-        BotCommand("status", "Show all bots and their state"),
+        BotCommand("ping", "Ping a Render bot or Supabase project"),
+        BotCommand("wake", "Resume a suspended Render service"),
+        BotCommand("sleep", "Suspend a running Render service"),
+        BotCommand("status", "Show all Render bots and their state"),
         BotCommand("add", "Add or edit a bot / Supabase project"),
-        BotCommand("remove", "Unregister a bot"),
-        BotCommand("list", "List all aliases and IDs"),
-        BotCommand("removesupabase", "Unregister a Supabase project"),
-        BotCommand("pingsupabase", "Ping all Supabase projects now"),
+        BotCommand("remove", "Remove a bot or Supabase project"),
+        BotCommand("list", "List everything registered"),
         BotCommand("help", "Show command reference"),
     ])
     await app.start()
