@@ -727,6 +727,7 @@ async def main() -> None:
         BotCommand("remove", "Remove a bot or Supabase project"),
         BotCommand("list", "List everything registered"),
         BotCommand("help", "Show command reference"),
+        BotCommand("cancel", "Cancel current operation"),
     ])
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
