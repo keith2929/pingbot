@@ -508,14 +508,27 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     bots = await load_bots()
-    if not bots:
-        await update.message.reply_text("No bots registered.")
-        return
+    projects = await load_supabase()
     lines = []
-    for alias, info in bots.items():
-        url_line = f"\n🔗 {info['url']}" if info.get("url") else ""
-        lines.append(f"• <b>{alias}</b>\n<code>{info['service_id']}</code>{url_line}")
-    await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
+
+    if bots:
+        lines.append("🤖 <b>Render bots</b>")
+        for alias, info in bots.items():
+            url_line = f"\n🔗 {info['url']}" if info.get("url") else ""
+            lines.append(f"• <b>{alias}</b>\n<code>{info['service_id']}</code>{url_line}")
+
+    if projects:
+        if lines:
+            lines.append("")
+        lines.append("🗄️ <b>Supabase projects</b>")
+        for name, creds in projects.items():
+            lines.append(f"• <b>{name}</b>\n🔗 {creds['url']}")
+
+    if not lines:
+        await update.message.reply_text("Nothing registered yet. Use /add to get started.")
+        return
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ---------- Remove bot (conversation)
