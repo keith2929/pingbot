@@ -430,9 +430,14 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await fetch_deploys(alias, bots[alias]["service_id"], query)
         return
 
-    if query.data.startswith("deploylog:"):
-        _, service_id, deploy_id, alias = query.data.split(":", 3)
-        await fetch_deploy_logs(service_id, deploy_id, alias, query)
+    if query.data.startswith("dl:"):
+        short_key = query.data[3:]
+        raw = await redis(["HGET", "pingbot:deploys", short_key])
+        if not raw:
+            await query.edit_message_text("❌ Deploy info expired. Run /deploys again.")
+            return
+        info = json.loads(raw)
+        await fetch_deploy_logs(info["service_id"], info["deploy_id"], info["alias"], query)
         return
 
     action, name = query.data.split(":", 1)
@@ -705,9 +710,14 @@ async def fetch_deploys(alias: str, service_id: str, query) -> None:
         created = d.get("createdAt", "")[:16].replace("T", " ")
         icon = DEPLOY_STATUS_ICON.get(deploy_status, "🔄")
         lines.append(f"{icon} <code>{deploy_id[:8]}</code> {created} — {deploy_status}")
+        # Store deploy metadata in Redis with a short key to stay under Telegram's 64-byte callback limit
+        short_key = deploy_id[:12]
+        await redis(["HSET", "pingbot:deploys", short_key, json.dumps({
+            "service_id": service_id, "deploy_id": deploy_id, "alias": alias
+        })])
         buttons.append([InlineKeyboardButton(
             f"{icon} {created} {deploy_status}",
-            callback_data=f"deploylog:{service_id}:{deploy_id}:{alias}"
+            callback_data=f"dl:{short_key}"
         )])
 
     await query.edit_message_text(
@@ -740,7 +750,7 @@ async def fetch_deploy_logs(service_id: str, deploy_id: str, alias: str, query) 
         await query.edit_message_text("❌ Could not determine workspace owner ID.")
         return
 
-    params = f"ownerId={owner_id}&resource[]={service_id}&limit=100&direction=backward"
+    params = f"ownerId={owner_id}&resource={service_id}&limit=100&direction=backward"
     if created_at:
         params += f"&startTime={created_at}"
     if finished_at:
