@@ -660,6 +660,53 @@ async def supabase_ping_loop(bot) -> None:
         await ping_supabase_projects(bot)
 
 
+# ---------- Render keep-alive loop
+
+KEEPALIVE_INTERVAL = 13 * 60  # 13 minutes — under Render's 15-min wind-down threshold
+
+
+async def ping_url(url: str) -> tuple[bool, int | None]:
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, timeout=30, follow_redirects=True)
+        return r.status_code < 500, r.status_code
+    except Exception:
+        return False, None
+
+
+async def render_keepalive_loop(bot) -> None:
+    while True:
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+        bots = await load_bots()
+        if not bots:
+            continue
+
+        results = []
+        any_down = False
+        for alias, info in bots.items():
+            url = info.get("url", "")
+            if not url:
+                continue
+            ok, code = await ping_url(url)
+            if ok:
+                results.append(f"🟢 <b>{alias}</b> — alive ({code})")
+            else:
+                results.append(f"🔴 <b>{alias}</b> — no response (code: {code})")
+                any_down = True
+
+        if not results:
+            continue
+
+        # Always notify so you know keep-alive is running; use silent if all ok
+        msg = "🏓 <b>Keep-alive ping</b>\n\n" + "\n".join(results)
+        await bot.send_message(
+            chat_id=ALLOWED_USER_ID,
+            text=msg,
+            parse_mode="HTML",
+            disable_notification=not any_down,  # silent if all good, loud if something's down
+        )
+
+
 
 
 # ---------- Deploys
@@ -876,6 +923,7 @@ async def main() -> None:
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Controller bot started.")
     asyncio.create_task(supabase_ping_loop(app.bot))
+    asyncio.create_task(render_keepalive_loop(app.bot))
     await asyncio.Event().wait()
 
 
