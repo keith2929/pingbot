@@ -24,6 +24,7 @@ REDIS_BOTS_KEY = "pingbot:bots"
 REDIS_SUPABASE_KEY = "pingbot:supabase"
 
 SUPABASE_PING_INTERVAL = 6 * 24 * 60 * 60  # 6 days
+STATUS_CHECK_INTERVAL = 13 * 60            # 13 minutes
 
 # Conversation states
 (
@@ -538,18 +539,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = []
     for alias, info in bots.items():
-        status, body = await render_get(f"/services/{info['service_id']}")
-        if status == 200:
-            svc = body.get("service", body)
-            suspended = svc.get("suspended", "")
-            if suspended == "not_suspended":
-                icon, state_str = "🟢", "running"
-            elif suspended == "suspended":
-                icon, state_str = "⏸️", "suspended"
-            else:
-                icon, state_str = "❓", suspended or "unknown"
-        else:
-            icon, state_str = "❌", "error"
+        icon, state_str = await check_bot_state(alias, info)
         lines.append(f"{icon} <b>{alias}</b> — {state_str}\n<code>{info['service_id']}</code>")
 
     await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
@@ -660,51 +650,53 @@ async def supabase_ping_loop(bot) -> None:
         await ping_supabase_projects(bot)
 
 
-# ---------- Render keep-alive loop
+# ---------- Bot state check
 
-KEEPALIVE_INTERVAL = 13 * 60  # 13 minutes — under Render's 15-min wind-down threshold
+async def check_bot_state(alias: str, info: dict) -> tuple[str, str]:
+    """Returns (icon, state_str). Checks Render API + URL ping to detect wound-down."""
+    service_id = info.get("service_id", "")
+    url = info.get("url", "")
+
+    status, body = await render_get(f"/services/{service_id}")
+    if status != 200:
+        return "❌", "error"
+
+    svc = body.get("service", body)
+    suspended = svc.get("suspended", "")
+    if suspended == "suspended":
+        return "⏸️", "suspended"
+
+    # Not suspended — check if actually responding (vs wound down)
+    if url:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url, timeout=5, follow_redirects=True)
+            if r.status_code < 500:
+                return "🟢", "running"
+        except Exception:
+            pass
+        return "😴", "wound down"
+
+    return "🟢", "running (no URL to verify)"
 
 
-async def ping_url(url: str) -> tuple[bool, int | None]:
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, timeout=30, follow_redirects=True)
-        return r.status_code < 500, r.status_code
-    except Exception:
-        return False, None
-
-
-async def render_keepalive_loop(bot) -> None:
+async def status_check_loop(bot) -> None:
     while True:
-        await asyncio.sleep(KEEPALIVE_INTERVAL)
+        await asyncio.sleep(STATUS_CHECK_INTERVAL)
         bots = await load_bots()
         if not bots:
             continue
-
-        results = []
-        any_down = False
+        problems = []
         for alias, info in bots.items():
-            url = info.get("url", "")
-            if not url:
-                continue
-            ok, code = await ping_url(url)
-            if ok:
-                results.append(f"🟢 <b>{alias}</b> — alive ({code})")
-            else:
-                results.append(f"🔴 <b>{alias}</b> — no response (code: {code})")
-                any_down = True
-
-        if not results:
-            continue
-
-        # Always notify so you know keep-alive is running; use silent if all ok
-        msg = "🏓 <b>Keep-alive ping</b>\n\n" + "\n".join(results)
-        await bot.send_message(
-            chat_id=ALLOWED_USER_ID,
-            text=msg,
-            parse_mode="HTML",
-            disable_notification=not any_down,  # silent if all good, loud if something's down
-        )
+            icon, state = await check_bot_state(alias, info)
+            if icon in ("❌", "😴"):
+                problems.append(f"{icon} <b>{alias}</b> — {state}")
+        if problems:
+            await bot.send_message(
+                chat_id=ALLOWED_USER_ID,
+                text="⚠️ <b>Service alert</b>\n\n" + "\n".join(problems),
+                parse_mode="HTML",
+            )
 
 
 
@@ -923,7 +915,7 @@ async def main() -> None:
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Controller bot started.")
     asyncio.create_task(supabase_ping_loop(app.bot))
-    asyncio.create_task(render_keepalive_loop(app.bot))
+    asyncio.create_task(status_check_loop(app.bot))
     await asyncio.Event().wait()
 
 
