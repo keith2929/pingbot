@@ -24,7 +24,6 @@ REDIS_BOTS_KEY = "pingbot:bots"
 REDIS_SUPABASE_KEY = "pingbot:supabase"
 
 SUPABASE_PING_INTERVAL = 6 * 24 * 60 * 60  # 6 days
-STATUS_CHECK_INTERVAL = 13 * 60            # 13 minutes
 
 # Conversation states
 (
@@ -680,23 +679,6 @@ async def check_bot_state(alias: str, info: dict) -> tuple[str, str]:
     return "🟢", "running (no URL to verify)"
 
 
-async def status_check_loop(bot) -> None:
-    while True:
-        await asyncio.sleep(STATUS_CHECK_INTERVAL)
-        bots = await load_bots()
-        if not bots:
-            continue
-        problems = []
-        for alias, info in bots.items():
-            icon, state = await check_bot_state(alias, info)
-            if icon in ("❌", "😴"):
-                problems.append(f"{icon} <b>{alias}</b> — {state}")
-        if problems:
-            await bot.send_message(
-                chat_id=ALLOWED_USER_ID,
-                text="⚠️ <b>Service alert</b>\n\n" + "\n".join(problems),
-                parse_mode="HTML",
-            )
 
 
 
@@ -915,7 +897,6 @@ async def main() -> None:
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Controller bot started.")
     asyncio.create_task(supabase_ping_loop(app.bot))
-    asyncio.create_task(status_check_loop(app.bot))
     await asyncio.Event().wait()
 
 
