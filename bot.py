@@ -367,6 +367,39 @@ async def bot_picker(update: Update, action: str) -> None:
     )
 
 
+async def cmd_deploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not auth(update):
+        return
+    bots = await load_bots()
+    if not bots:
+        await update.message.reply_text("No bots registered. Use /add first.")
+        return
+    if ctx.args:
+        alias = ctx.args[0].lower()
+        if alias not in bots:
+            await update.message.reply_text(f"Unknown alias: {alias}")
+            return
+        await do_deploy(update.message.reply_text, alias, bots[alias]["service_id"])
+        return
+    buttons = [
+        [InlineKeyboardButton(alias, callback_data=f"deploy:{alias}")]
+        for alias in bots
+    ]
+    await update.message.reply_text(
+        "Which bot would you like to deploy?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def do_deploy(reply, alias: str, service_id: str) -> None:
+    status, body = await render_post(f"/services/{service_id}/deploys")
+    if status in (200, 201):
+        deploy_id = (body.get("id") or body.get("deploy", {}).get("id", ""))[:8]
+        await reply(f"🚀 Deploy triggered for <b>{alias}</b> (<code>{deploy_id}</code>)", parse_mode="HTML")
+    else:
+        await reply(f"❌ Failed to deploy {alias}: {body.get('message', body)}")
+
+
 async def cmd_wake(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
@@ -421,7 +454,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
     await query.answer()
 
-    if query.data.startswith("deploys:"):
+    if query.data.startswith("logs:"):
         _, alias = query.data.split(":", 1)
         bots = await load_bots()
         if alias not in bots:
@@ -434,7 +467,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         short_key = query.data[3:]
         raw = await redis(["HGET", "pingbot:deploys", short_key])
         if not raw:
-            await query.edit_message_text("❌ Deploy info expired. Run /deploys again.")
+            await query.edit_message_text("❌ Deploy info expired. Run /logs again.")
             return
         info = json.loads(raw)
         await fetch_deploy_logs(info["service_id"], info["deploy_id"], info["alias"], query)
@@ -473,6 +506,8 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await do_wake(reply, name, bots[name]["service_id"])
     elif action == "sleep":
         await do_sleep(reply, name, bots[name]["service_id"])
+    elif action == "deploy":
+        await do_deploy(reply, name, bots[name]["service_id"])
     elif action == "ping":
         url = bots[name].get("url", "")
         if not url:
@@ -694,7 +729,7 @@ DEPLOY_STATUS_ICON = {
     "pre_deploy_failed": "❌",
 }
 
-async def cmd_deploys(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     bots = await load_bots()
@@ -702,7 +737,7 @@ async def cmd_deploys(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No bots registered. Use /add first.")
         return
     buttons = [
-        [InlineKeyboardButton(alias, callback_data=f"deploys:{alias}")]
+        [InlineKeyboardButton(alias, callback_data=f"logs:{alias}")]
         for alias in bots
     ]
     await update.message.reply_text(
@@ -809,7 +844,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not auth(update):
         return
     lines = [
-        "/deploys — view recent deploys and logs",
+        "/deploy — manually trigger a deploy",
+        "/logs — view recent deploys and logs",
         "/ping — ping a Render bot or Supabase project",
         "/wake — resume a suspended Render service",
         "/sleep — suspend a running Render service",
@@ -871,7 +907,8 @@ async def main() -> None:
 
     app.add_handler(add_conv)
     app.add_handler(remove_conv)
-    app.add_handler(CommandHandler("deploys", cmd_deploys))
+    app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CommandHandler("deploy", cmd_deploy))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("wake", cmd_wake))
     app.add_handler(CommandHandler("sleep", cmd_sleep))
@@ -882,7 +919,8 @@ async def main() -> None:
 
     await app.initialize()
     await app.bot.set_my_commands([
-        BotCommand("deploys", "View recent deploys and logs"),
+        BotCommand("logs", "View recent deploys and logs"),
+        BotCommand("deploy", "Manually trigger a deploy"),
         BotCommand("ping", "Ping a Render bot or Supabase project"),
         BotCommand("wake", "Resume a suspended Render service"),
         BotCommand("sleep", "Suspend a running Render service"),
